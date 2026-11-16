@@ -164,6 +164,7 @@ specific language governing permissions and limitations under the License.
 #include <string.h>
 //
 #include "pico/mutex.h"
+#include "hardware/watchdog.h"
 //
 #include "hw_config.h"  // Hardware Configuration of the SPI and SD Card "objects"
 #include "my_debug.h"
@@ -353,6 +354,10 @@ static bool sd_wait_ready(sd_card_t *pSD, int timeout) {
     // DO line
     absolute_time_t timeout_time = make_timeout_time_ms(timeout);
     do {
+        // A card doing internal housekeeping can stay busy for a long time
+        // and one multi-block transfer may wait here several times; the wait
+        // itself is bounded, so keep the watchdog for real hangs only.
+        watchdog_update();
         resp = sd_spi_write(pSD, 0xFF);
     } while (resp == 0x00 &&
              0 < absolute_time_diff_us(get_absolute_time(), timeout_time));
@@ -764,6 +769,7 @@ static bool sd_wait_token(sd_card_t *pSD, uint8_t token) {
     const uint32_t timeout = SD_COMMAND_TIMEOUT;  // Wait for start token
     absolute_time_t timeout_time = make_timeout_time_ms(timeout);
     do {
+        watchdog_update();  // bounded wait, see sd_wait_ready()
         if (token == sd_spi_write(pSD, SPI_FILL_CHAR)) {
             return true;
         }

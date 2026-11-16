@@ -49,8 +49,10 @@ static spi_t spis[] = {  // One for each SPI.
         .mosi_gpio = SD_MOSI_PIN,
         .sck_gpio = SD_CLK_PIN,
         .set_drive_strength = true,
-        .mosi_gpio_drive_strength = GPIO_DRIVE_STRENGTH_2MA,
-        .sck_gpio_drive_strength = GPIO_DRIVE_STRENGTH_2MA,
+        // 4 mA = RP2350 pad default, the setting large USB-disk-mode
+        // transfers were tested with (upstream uses 2 mA).
+        .mosi_gpio_drive_strength = GPIO_DRIVE_STRENGTH_4MA,
+        .sck_gpio_drive_strength = GPIO_DRIVE_STRENGTH_4MA,
 
         /* The choice of SD card matters! SanDisk runs at the highest speed. PNY
            can only mangage 5 MHz. Those are all I've tried. */
