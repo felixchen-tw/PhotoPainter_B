@@ -37,6 +37,10 @@
 #define MAGIC_REFRESH        0x52465348u     // "RFSH"
 #define MAGIC_DISK_ACTIVE    0x41435456u     // "ACTV"
 #define EXIT_MAGIC           0x45580000u     // "EX" + reason in the low half
+#define IO_MAGIC             0x494F0000u     // "IO" + state << 8 + slowest write (100 ms units)
+#define IO_IDLE              0
+#define IO_READ              1
+#define IO_WRITE             2
 
 typedef enum {
     EXIT_VBUS = 1,
@@ -68,6 +72,16 @@ static absolute_time_t eject_time;
 static absolute_time_t last_io;
 static char last_exit_msg[128];
 static uint32_t read_errors, write_errors;
+static uint32_t slowest_write_ms;
+
+// While disk mode runs, scratch[1] says whether we are inside an SD read or
+// write, so a watchdog reset can be attributed (leave_disk_mode() overwrites
+// it with the exit reason).
+static void io_state(uint32_t state)
+{
+    uint32_t units = slowest_write_ms / 100;
+    watchdog_hw->scratch[SCRATCH_EXIT_IDX] = IO_MAGIC | (state << 8) | (units > 0xff ? 0xff : units);
+}
 
 static void count_sd_error(bool write)
 {
@@ -94,11 +108,20 @@ static void record_last_exit(void)
     watchdog_hw->scratch[SCRATCH_ACTIVE_IDX] = 0;
     watchdog_hw->scratch[SCRATCH_ERRORS_IDX] = 0;
 
-    uint32_t why = exitInfo & 0xffffu;
+    uint32_t why = exitInfo & 0xffu;
     if ((exitInfo & 0xffff0000u) == EXIT_MAGIC && why >= EXIT_VBUS && why <= EXIT_NO_HOST) {
-        snprintf(last_exit_msg, sizeof last_exit_msg, "USB disk mode ended: %s", EXIT_REASON_STR[why]);
+        uint32_t units = (exitInfo >> 8) & 0xff;   // slowest SD write, 100 ms units
+        snprintf(last_exit_msg, sizeof last_exit_msg, "USB disk mode ended: %s, slowest SD write %lu.%lu s",
+                 EXIT_REASON_STR[why], (unsigned long)(units / 10), (unsigned long)(units % 10));
     } else if (wasActive && watchdog_enable_caused_reboot()) {
-        snprintf(last_exit_msg, sizeof last_exit_msg, "USB disk mode ended: watchdog timeout (firmware stuck > 8 s)");
+        const char *where = "outside SD I/O";
+        if ((exitInfo & 0xffff0000u) == IO_MAGIC) {
+            uint32_t st = (exitInfo >> 8) & 0xff;
+            where = st == IO_WRITE ? "in SD write" : st == IO_READ ? "in SD read" : "outside SD I/O";
+        }
+        snprintf(last_exit_msg, sizeof last_exit_msg,
+                 "USB disk mode ended: watchdog timeout (stuck > 8 s %s, slowest SD write %lu.%lu s)", where,
+                 (unsigned long)((exitInfo & 0xff) / 10), (unsigned long)((exitInfo & 0xff) % 10));
     } else if (wasActive) {
         snprintf(last_exit_msg, sizeof last_exit_msg, "USB disk mode ended: unexpected reset");
     } else if ((stageInfo & 0xff000000u) == DIAG_STAGE_MAGIC && watchdog_enable_caused_reboot()) {
@@ -182,7 +205,8 @@ void usb_disk_request_and_reboot(void)
 
 static void __attribute__((noreturn)) leave_disk_mode(bool refresh, exit_reason_t why)
 {
-    watchdog_hw->scratch[SCRATCH_EXIT_IDX] = EXIT_MAGIC | why;
+    uint32_t units = slowest_write_ms / 100;
+    watchdog_hw->scratch[SCRATCH_EXIT_IDX] = EXIT_MAGIC | ((units > 0xff ? 0xff : units) << 8) | why;
     watchdog_hw->scratch[SCRATCH_ACTIVE_IDX] = 0;
     DEV_Digital_Write(LED_ACT, 0);
     tud_disconnect();
@@ -222,6 +246,7 @@ void usb_disk_run(void)
     }
 
     tusb_init();
+    io_state(IO_IDLE);
     watchdog_hw->scratch[SCRATCH_ERRORS_IDX] = ERRORS_MAGIC;   // 0 errors so far
     watchdog_hw->scratch[SCRATCH_ACTIVE_IDX] = MAGIC_DISK_ACTIVE;
 
@@ -352,7 +377,10 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
     }
     watchdog_update();
     last_io = get_absolute_time();
-    if (sd_read_blocks(sd, buffer, lba, bufsize / BLOCK_SIZE) != SD_BLOCK_DEVICE_ERROR_NONE) {
+    io_state(IO_READ);
+    int rc = sd_read_blocks(sd, buffer, lba, bufsize / BLOCK_SIZE);
+    io_state(IO_IDLE);
+    if (rc != SD_BLOCK_DEVICE_ERROR_NONE) {
         count_sd_error(false);
         tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);    // unrecovered read error
         return -1;
@@ -368,7 +396,15 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
     }
     watchdog_update();
     last_io = get_absolute_time();
-    if (sd_write_blocks(sd, buffer, lba, bufsize / BLOCK_SIZE) != SD_BLOCK_DEVICE_ERROR_NONE) {
+    io_state(IO_WRITE);
+    uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    int rc = sd_write_blocks(sd, buffer, lba, bufsize / BLOCK_SIZE);
+    uint32_t took = to_ms_since_boot(get_absolute_time()) - t0;
+    if (took > slowest_write_ms) {
+        slowest_write_ms = took;
+    }
+    io_state(IO_IDLE);
+    if (rc != SD_BLOCK_DEVICE_ERROR_NONE) {
         count_sd_error(true);
         tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x0C, 0x00);    // write error
         return -1;
